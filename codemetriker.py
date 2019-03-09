@@ -17,10 +17,21 @@ import collections
 import concurrent.futures
 import urllib.parse
 import enum
+import re
+import numpy
+import pathlib
+
+import pandas.plotting
+
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+#from pandas.tools.plotting import parallel_coordinates
 
 
 
-DEFAULT_STEPS=4
+
+DEFAULT_STEPS=20
 
 class Db:
 
@@ -87,8 +98,8 @@ class HarvesterAuthors(HarvesterStageOne):
         """
         filepath = os.path.dirname(os.path.realpath(filename))
         filename_only = os.path.basename(filename)
-        authors = git_authors_by_line(filepath, filename_only, aliases=config.aliases, cwd=filepath)
-        return pandas.DataFrame(authors, columns=["author"])
+        authors = git_blame_by_line(filepath, filename_only, aliases=config.aliases, cwd=filepath)
+        return pandas.DataFrame(authors, columns=['author', 'commit_id', 'codeline'])
 
     def _calc_authors_parallel(self, filenamelist):
         with concurrent.futures.ThreadPoolExecutor(max_workers=self._thread_executors) as executor:
@@ -116,7 +127,6 @@ class HarvesterAuthors(HarvesterStageOne):
                     continue
                 filenamelist.append(os.path.join(self._path_root, dirpath, f))
             self._calc_authors_parallel(filenamelist)
-            #sys.stderr.write('\r  {} files analyzed'.format(len(self._authors)))
 
     @property
     def authors(self):
@@ -259,7 +269,12 @@ class HarvesterLoc(HarvesterStageOne):
         cmd = 'cloc --by-file --json {}'.format(self._path_root)
         result = subprocess.run(cmd.split(), stdout=subprocess.PIPE, stderr=devnull)
         loc = result.stdout.decode('utf-8')
-        cloc = json.loads(loc)
+        try:
+            cloc = json.loads(loc)
+        except json.decoder.JSONDecodeError:
+            # may happend that the first commit includes no
+            # files at all
+            return {}
         del cloc['SUM']
         del cloc['header']
         return cloc
@@ -269,7 +284,12 @@ class HarvesterLoc(HarvesterStageOne):
         cmd = 'cloc --json {}'.format(self._path_root)
         result = subprocess.run(cmd.split(), stdout=subprocess.PIPE, stderr=devnull)
         loc = result.stdout.decode('utf-8')
-        cloc = json.loads(loc)
+        try:
+            cloc = json.loads(loc)
+        except json.decoder.JSONDecodeError:
+            # may happend that the first commit includes no
+            # files at all
+            return {}
         del cloc['header']
         return cloc
 
@@ -295,14 +315,25 @@ class HarvesterFunctionAuthors(HarvesterStageTwo):
     def run(self):
         for index, row in self._harvester.functions_df.iterrows():
             function = row['function']
+            cc = row['cc']
+            nloc = row['nloc']
+            token = row['token']
+            filename = row['filename']
             # self._harvester.authors count line numbers starting
             # with 0, so synchronize lizard and HarvesterAuthors
             # here and subtract one
             line_start = row['line_start'] - 1
             line_end = row['line_end'] - 1
-            authors_df = self._harvester.authors[row['filename']]
+            authors_df = self._harvester.authors[filename]
             author = authors_df.iloc[line_start:line_end + 1]['author'].value_counts().idxmax()
-            self._function_authors[function] = author
+
+            obj = types.SimpleNamespace()
+            obj.author = author
+            obj.cc = cc
+            obj.nloc = nloc
+            obj.token = token
+            obj.filename = filename
+            self._function_authors[function] = obj
 
     @property
     def function_authors(self):
@@ -358,7 +389,7 @@ class CodeMetric:
     def _process_commits(self, commits):
 
         for commit in commits:
-            print('process commit {}'.format(commit[0]))
+            print('harvest commit {}'.format(commit[0]))
             git_worktree_checkout(self._root_scheme,  self._root, self._path_worktree, commit[0])
             tle = Db.Timeline.TimelineEntry(commit[0], commit[1])
 
@@ -513,8 +544,10 @@ def git_id_by_date(gitdir, date):
     cmd = 'TZ=UTC git -C {} rev-list -1 --before="{}" HEAD'.format(gitdir, formated_date)
     return subprocess.check_output(cmd, shell=True).decode("utf-8").strip()
 
-def git_authors_by_line(gitdir, filepath, aliases=None, cwd=os.getcwd()):
-    cmd = 'git -C {} blame -e -- {}'.format(gitdir, filepath)
+RE_BLAME = re.compile(r'^\^?(\S+)\W+<(\S+)>.*?\)(.*)')
+
+def git_blame_by_line(gitdir, filepath, aliases=None, cwd=os.getcwd()):
+    cmd = 'git -C {} blame -l -b -c --root --encoding=utf-8 --date=unix -e -- {}'.format(gitdir, filepath)
     output = subprocess.check_output(cmd.split(), shell=False, cwd=cwd)
     try:
         decoded = output.decode("utf-8").rstrip()
@@ -522,12 +555,13 @@ def git_authors_by_line(gitdir, filepath, aliases=None, cwd=os.getcwd()):
         decoded = output.decode("ISO-8859-1").rstrip()
     res = []
     for line in decoded.split('\n'):
-        ob = line.find('<')
-        oe = line.find('>', ob)
-        email = line[ob + 1:oe]
+        m = RE_BLAME.match(line)
+        if m is None:
+            continue
+        commit_id, email, codeline = m.group(1, 2, 3)
         if aliases and email in aliases:
             email = aliases[email]
-        res.append(email)
+        res.append((email, commit_id, codeline))
     return res
 
 def git_worktree_remove(gitdir, path_worktree):
@@ -554,14 +588,11 @@ def git_worktree_checkout_file(gitdir, path_worktree, id_):
     process.wait()
 
 def git_worktree_checkout_url(gitdir, path_worktree, id_):
-    print('')
-    print(id_)
-    print('')
     devnull = open(os.devnull, 'w')
     cmd = 'git -C {} submodule deinit --all'.format(gitdir, id_)
     process = subprocess.Popen(cmd.split(), shell=False)
     process.wait()
-    cmd = 'git -C {} checkout -b {} --force {}'.format(gitdir, id_, id_)
+    cmd = 'git -C {} checkout -b {}-rev --force {}'.format(gitdir, id_, id_)
     process = subprocess.Popen(cmd.split(), shell=False)
     process.wait()
     cmd = 'git -C {} submodule sync --recursive'.format(gitdir)
@@ -590,7 +621,6 @@ def git_worktree_clone_file(gitdir, path_worktree):
     pass
 
 def git_worktree_clone_url(url, path_worktree):
-    print('file')
     devnull = open(os.devnull, 'w')
     shutil.rmtree(path_worktree, ignore_errors=True)
     os.makedirs(path_worktree)
@@ -674,16 +704,90 @@ class AnalyzerAuthors:
         self._db = db
 
     def _check_required_harvester(self):
-        print(self._db.timeline[-1].harvester.function_authors)
-        if self._db.timeline[-1].harvester.function_authors:
-            return True
-        return False
+        if not self._db.timeline[-1].harvester.function_authors:
+            return False
+        return True
+
+    def _save_author_best_worse(self, authors):
+        # create parent dir
+        for author, data in authors.items():
+            directory = self._config.output_directory / 'author' / author
+            directory.mkdir(parents=True, exist_ok=True)
+            filepath = directory / 'best-worst-cc.md'
+            with open(filepath, 'w') as fd:
+                fd.write('# Best and Worst Function\n')
+                fd.write('\n')
+                fd.write('## Best Function (lowest cc)\n')
+                fd.write('\n')
+                fd.write('CC: {}\n'.format(data['best-cc-val']))
+                fd.write('{}:{}\n'.format(data['best-cc-filename'], data['best-cc-function']))
+                fd.write('\n')
+                fd.write('## Worst Function (highest cc)\n')
+                fd.write('\n')
+                fd.write('CC: {}\n'.format(data['worst-cc-val']))
+                fd.write('{}:{}\n'.format(data['worst-cc-filename'], data['worst-cc-function']))
+
+
+    def _calc_author_best_worse(self, function_authors):
+        authors = dict()
+        for function, info in function_authors.items():
+            if info.author not in authors:
+                authors[info.author] = dict()
+                authors[info.author]['best-cc-val'] = info.cc
+                authors[info.author]['best-cc-filename'] = info.filename
+                authors[info.author]['best-cc-function'] = function
+                authors[info.author]['worst-cc-val'] = info.cc
+                authors[info.author]['worst-cc-filename'] = info.filename
+                authors[info.author]['worst-cc-function'] = function
+            if info.cc < authors[info.author]['best-cc-val']:
+                authors[info.author]['best-cc-val'] = info.cc
+                authors[info.author]['best-cc-filename'] = info.filename
+                authors[info.author]['best-cc-function'] = function
+            elif info.cc > authors[info.author]['worst-cc-val']:
+                authors[info.author]['worst-cc-val'] = info.cc
+                authors[info.author]['worst-cc-filename'] = info.filename
+                authors[info.author]['worst-cc-function'] = function
+        self._save_author_best_worse(authors)
+
+    def _calc_overall_parallel_coordinates(self):
+        # nice example:
+        # https://stackoverflow.com/questions/29803480/plotting-parallel-coordinates-in-pandas-with-different-colours
+        data = dict()
+        columns = []
+        for entry in self._db.timeline:
+            columns.append(entry.date)
+            function_authors = entry.harvester.function_authors
+            for function, info in function_authors.items():
+                if function not in data:
+                    data[function] = dict()
+                    data[function]['data'] = list()
+                cc = int(info.cc)
+                if cc > 100:
+                    cc = numpy.nan
+                data[function]['data'].append(cc)
+                data[function]['author'] = info.author
+        columns.append('Author')
+        # normalize (e.g. some functions may appear or disappear
+        # over time, make NaNs of them
+        df = pandas.DataFrame(columns=columns)
+        for function, data_data in data.items():
+            number_entries = len(data_data['data'])
+            adjustment_no = len(self._db.timeline) - number_entries
+            for _ in range(adjustment_no):
+                data_data['data'].insert(0, numpy.nan)
+            data_data['data'].append(data_data['author'])
+            df.loc[len(df)] = data_data['data']
+        plt.figure()
+        pandas.plotting.parallel_coordinates(df, "Author", colormap=plt.cm.tab10, alpha=0.9, linewidth=.7)
+        plt.show()
+
 
     def _calc_data(self):
-        for entry in self._db.timeline:
-            function_authors = entry.harvester.function_authors
-            for function, author in function_authors.items():
-                print('{} => {}'.format(function, authors))
+        # just for the last (actual) commit, this reflects
+        # the current state, not some outdated, year old commits
+        function_authors = self._db.timeline[-1].harvester.function_authors
+        self._calc_author_best_worse(function_authors)
+        self._calc_overall_parallel_coordinates()
 
 
     def run(self):
@@ -693,14 +797,15 @@ class AnalyzerAuthors:
             # is an error), but signals that run was not
             # possible
             return False
-        return True
         self._calc_data()
+        return True
 
 class Config:
 
-    def __init__(self, aliases, output_directory):
+    def __init__(self, aliases, output_directory, components=None):
         self.aliases = aliases
-        self.output_directory = output_directory
+        self.components = components or dict()
+        self.output_directory = pathlib.Path(output_directory)
 
 
 if __name__ == "__main__":
@@ -717,7 +822,14 @@ if __name__ == "__main__":
         'hagen@jauu.net' : 'Hagen'
     }
 
-    config = Config(aliases, '/tmp/codemetric-analyzer')
+    components = {
+        '/lib/foo'     : 'foo',
+        '/package/foo' : 'foo',
+    }
+
+    output_directory = '/tmp/codemetric-analyzer'
+
+    config = Config(aliases, output_directory, components=components)
     #harvester = None
     harvester = [ AnalyzerType.Full ]
     #harvester = CodeMetric.minimal_... # preset
@@ -730,6 +842,7 @@ if __name__ == "__main__":
     # #for entry in cm.db.timeline:
 
     # print(entry.__dict__)
+    config.output_directory /= 'time-equidistant'
     a = AnalyzerAuthors(config, cm.db, limits=None)
     a.run()
 
