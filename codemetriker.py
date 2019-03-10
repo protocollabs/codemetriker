@@ -79,7 +79,7 @@ class HarvesterStageOne: pass
 # Harvester with dependencies to results from Stage One Harvester
 class HarvesterStageTwo: pass
 
-class HarvesterAuthors(HarvesterStageOne):
+class HarvesterFileAuthors(HarvesterStageOne):
 
     def __init__(self, path_root, config):
         self._path_root = path_root
@@ -320,7 +320,7 @@ class HarvesterFunctionAuthors(HarvesterStageTwo):
             token = row['token']
             filename = row['filename']
             # self._harvester.authors count line numbers starting
-            # with 0, so synchronize lizard and HarvesterAuthors
+            # with 0, so synchronize lizard and HarvesterFileAuthors
             # here and subtract one
             line_start = row['line_start'] - 1
             line_end = row['line_end'] - 1
@@ -351,6 +351,7 @@ class CodeMetric:
         self._db = None
         self._init_path_worktree(worktreepath)
         self._init_repo()
+        self._clean_output_directory()
 
     def _init_repo(self):
         # clone the repo first, if argument is an URL
@@ -359,6 +360,12 @@ class CodeMetric:
         # self._path_worktree which is now also the new self.root
         if self._root_scheme == 'URL':
             self._root = self._path_worktree
+
+    def _clean_output_directory(self):
+        path = self._config.output_directory
+        if not path.exists():
+            return
+        shutil.rmtree(str(path))
 
     def _detect_schema_project_root(self):
         """
@@ -411,7 +418,7 @@ class CodeMetric:
             tle.harvester.functions_df = h.df_functions
 
             # print('  harvest author')
-            h = HarvesterAuthors(self._path_worktree, self._config)
+            h = HarvesterFileAuthors(self._path_worktree, self._config)
             h.run()
             tle.harvester.authors = h.authors
 
@@ -714,7 +721,7 @@ class AnalyzerAuthors:
             directory = self._config.output_directory / 'author' / author
             directory.mkdir(parents=True, exist_ok=True)
             filepath = directory / 'best-worst-cc.md'
-            with open(filepath, 'w') as fd:
+            with filepath.open(mode='w') as fd:
                 fd.write('# Best and Worst Function\n')
                 fd.write('\n')
                 fd.write('## Best Function (lowest cc)\n')
@@ -749,7 +756,38 @@ class AnalyzerAuthors:
                 authors[info.author]['worst-cc-function'] = function
         self._save_author_best_worse(authors)
 
-    def _calc_overall_parallel_coordinates(self):
+    def _draw_authors_average_cc(self):
+        authors = dict()
+        for i, entry in enumerate(self._db.timeline):
+            function_authors = entry.harvester.function_authors
+            tmp = dict()
+            for function, info in function_authors.items():
+                cc = info.cc
+                author = info.author
+                if author not in tmp:
+                    tmp[author] = list()
+                tmp[author].append(cc)
+            for author, data in tmp.items():
+                avg = sum(data) / float(len(data))
+                if author not in authors:
+                    authors[author] = types.SimpleNamespace()
+                    authors[author].x = list()
+                    authors[author].y = list()
+                authors[author].x.append(i)
+                authors[author].y.append(avg)
+        # and draw the dataset now
+        fig = plt.figure()
+        ax = fig.add_subplot(1,1,1)
+        for author, data in authors.items():
+            if len(data.x) < 2:
+                continue
+            ax.plot(data.x, data.y, label=author)
+        plt.legend(loc='upper left')
+        outpath = self._config.output_directory / 'cc-all-authors.png'
+        fig.savefig(str(outpath), dpi=300, bbox_inches="tight")
+
+
+    def _draw_function_cc_with_authors(self):
         # nice example:
         # https://stackoverflow.com/questions/29803480/plotting-parallel-coordinates-in-pandas-with-different-colours
         data = dict()
@@ -777,9 +815,49 @@ class AnalyzerAuthors:
                 data_data['data'].insert(0, numpy.nan)
             data_data['data'].append(data_data['author'])
             df.loc[len(df)] = data_data['data']
-        plt.figure()
-        pandas.plotting.parallel_coordinates(df, "Author", colormap=plt.cm.tab10, alpha=0.9, linewidth=.7)
-        plt.show()
+        fig = plt.figure()
+        ax1 = fig.add_subplot(1,1,1)
+        ax = pandas.plotting.parallel_coordinates(df, "Author", ax=ax1, colormap=plt.cm.tab10,
+                                                  alpha=0.9, linewidth=.7)
+        ax.grid(False)
+        outpath = self._config.output_directory / 'cc-all-functions-author.png'
+        fig.savefig(str(outpath), dpi=300, bbox_inches="tight")
+
+    def _draw_function_cc_without_authors(self):
+        data = dict()
+        columns = []
+        for entry in self._db.timeline:
+            columns.append(entry.date)
+            function_authors = entry.harvester.function_authors
+            for function, info in function_authors.items():
+                if function not in data:
+                    data[function] = dict()
+                    data[function]['data'] = list()
+                cc = int(info.cc)
+                if cc > 100:
+                    cc = numpy.nan
+                data[function]['data'].append(cc)
+                data[function]['function'] = function
+        columns.append('Function')
+        # normalize (e.g. some functions may appear or disappear
+        # over time, make NaNs of them
+        df = pandas.DataFrame(columns=columns)
+        for function, data_data in data.items():
+            number_entries = len(data_data['data'])
+            adjustment_no = len(self._db.timeline) - number_entries
+            for _ in range(adjustment_no):
+                data_data['data'].insert(0, numpy.nan)
+            data_data['data'].append(data_data['function'])
+            df.loc[len(df)] = data_data['data']
+        fig = plt.figure()
+        ax1 = fig.add_subplot(1,1,1)
+        ax = pandas.plotting.parallel_coordinates(df, "Function", ax=ax1, colormap=plt.cm.tab10,
+                                                  alpha=0.8, linewidth=.5)
+        ax.grid(False)
+        ax.get_legend().remove()
+        outpath = self._config.output_directory / 'cc-all-functions-without-author.png'
+        fig.savefig(str(outpath), dpi=300, bbox_inches="tight")
+
 
 
     def _calc_data(self):
@@ -787,7 +865,9 @@ class AnalyzerAuthors:
         # the current state, not some outdated, year old commits
         function_authors = self._db.timeline[-1].harvester.function_authors
         self._calc_author_best_worse(function_authors)
-        self._calc_overall_parallel_coordinates()
+        self._draw_function_cc_with_authors()
+        self._draw_authors_average_cc()
+        self._draw_function_cc_without_authors()
 
 
     def run(self):
@@ -843,6 +923,7 @@ if __name__ == "__main__":
 
     # print(entry.__dict__)
     config.output_directory /= 'time-equidistant'
+    config.output_directory.mkdir(parents=True, exist_ok=True)
     a = AnalyzerAuthors(config, cm.db, limits=None)
     a.run()
 
