@@ -20,6 +20,8 @@ import enum
 import re
 import numpy
 import pathlib
+import argparse
+import mimetypes
 
 import pandas.plotting
 
@@ -98,6 +100,8 @@ class HarvesterFileAuthors(HarvesterStageOne):
         """
         filepath = os.path.dirname(os.path.realpath(filename))
         filename_only = os.path.basename(filename)
+        if not os.path.isfile(filename):
+            return None
         authors = git_blame_by_line(filepath, filename_only, aliases=config.aliases, cwd=filepath)
         return pandas.DataFrame(authors, columns=['author', 'commit_id', 'codeline'])
 
@@ -107,12 +111,16 @@ class HarvesterFileAuthors(HarvesterStageOne):
             for future in concurrent.futures.as_completed(future_to_filename):
                 filename = future_to_filename[future]
                 data = future.result()
+                if data is None:
+                    continue
                 sanitized_filename = filename[len(self._path_root):] # we remove the tmp dir
                 self._authors[sanitized_filename] = data
 
     def _calc_authors_single_threaded(self, filenamelist):
         for filename in filenamelist:
             data = self._process_file(filename)
+            if data is None:
+                continue
             sanitized_filename = filename[len(self._path_root):] # we remove the tmp dir
             self._authors[sanitized_filename] = data
 
@@ -185,6 +193,13 @@ class HarvesterFunction(HarvesterStageOne):
                     continue
                 self._df_functions = self._df_functions.append(df)
 
+    def _lizard_single_threaded(self, filenamelist):
+        for filename in filenamelist:
+            df = self._lizard_file(filename)
+            if df is None:
+                continue
+            self._df_functions = self._df_functions.append(df)
+
     def _calc_lizard(self):
         """
            filename      function cc nloc token line_start line_end
@@ -202,14 +217,22 @@ class HarvesterFunction(HarvesterStageOne):
             if '.git' in dirpath:
                 continue
             for f in filenames:
+                fullpath = os.path.join(self._path_root, dirpath, f)
                 if f in ('.git'):
                     continue
                 if f.endswith('.template'):
                     continue
                 if f.endswith('.json'):
                     continue
-                filenamelist.append(os.path.join(self._path_root, dirpath, f))
+                mimetype, _ = mimetypes.guess_type(fullpath)
+                if mimetype is None:
+                    # ignore any files not guessable, this boils
+                    # down to binary files, gitignore, et cetera
+                    #print('ignoreing: ' + filename)
+                    continue
+                filenamelist.append(fullpath)
             self._lizard_parallel(filenamelist)
+            #self._lizard_single_threaded(filenamelist)
 
     @property
     def df_functions(self):
@@ -381,6 +404,9 @@ class CodeMetric:
 
     def _init_path_worktree(self, worktreepath):
         if worktreepath:
+            if os.path.exists(worktreepath):
+                shutil.rmtree(worktreepath)
+            os.makedirs(worktreepath, exist_ok=True)
             self._path_worktree = worktreepath
             return
         self._path_worktree = tempfile.TemporaryDirectory().name
@@ -895,8 +921,17 @@ if __name__ == "__main__":
     #path = '/home/pfeifer/src/code/misc/libeve'
     path = '/home/pfeifer/src/code/foreign/ngtcp2'
 
-    if len(sys.argv) > 1:
-        path = sys.argv[1]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c", "--commit-range", help="commit-range", type=str, default=None)
+    parser.add_argument('location')
+    args = parser.parse_args()
+
+    commitish_range=None
+    if args.commit_range:
+        commitish_range = args.commit_range.split(':')
+        #commitish_range=['449005104fb312c0e52cd41f86194fa8bc12b631', 'HEAD']
+    if args.location:
+        path = args.location
 
     aliases = {
         'hagen@jauu.net' : 'Hagen'
@@ -917,7 +952,7 @@ if __name__ == "__main__":
     #cm.calculate_by_tags()
     #for entry in cm.db.timeline:
     #    print(entry.__dict__)
-    cm.calculate_by_time()
+    cm.calculate_by_time(commitish_range=commitish_range)
 
     # #for entry in cm.db.timeline:
 
